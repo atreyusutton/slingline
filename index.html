@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Slingline</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #game {
+    display: block;
+    background: #000;
+    image-rendering: optimizeSpeed;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+/* =====================================================================
+   SLINGLINE — single-file canvas prototype
+   ---------------------------------------------------------------------
+   TUNING KNOBS — tweak these to change the game feel.
+   ===================================================================== */
+const FLIGHT_SPEED_MULT      = 0.90; // multiplier on launch speed when released
+const ORBIT_BASE_ANGULAR_VEL = 2.40; // base orbit speed (radians / second)
+const CHARGE_RATE            = 1.80; // how hard the orbit accelerates while charged
+const CAMERA_SMOOTH_TIME     = 0.30; // camera spring response (s) — lower = snappier
+const CAMERA_LEAD_TIME       = 0.55; // how far ahead of the ship the camera looks (s)
+const COLLAPSE_RISE_SPEED    = 13;   // red collapse creep upward (world px / second)
+const TETHER_ZONE_OFFSET     = 60;   // tether-zone radius = planetRadius + this
+
+/* Secondary constants (kept here for clarity) */
+const CHARGE_TIME        = 1.20;     // seconds to fully charge an orbit
+const OVERCHARGE_ORBITS  = 2.5;      // full orbits you can hold before the orbit collapses
+const ORBIT_MAX_ANG_VEL  = 6.0;      // cap on orbit speed carried in from momentum
+const LAUNCH_SPEED_MAX   = 3200;     // sanity cap on launch speed (px / second)
+const PERFECT_WINDOW     = 0.30;     // charge tolerance (± full) for a perfect release
+const PERFECT_BONUS      = 1.35;     // launch-speed multiplier on a perfect release
+const COMBO_STEP         = 0.5;      // score multiplier added per chained perfect release
+const COLLAPSE_ACCEL     = 1.6;      // how fast the collapse speeds up (px/s per second)
+const LOGICAL_W          = 400;
+const LOGICAL_H          = 800;
+const DRONE_RADIUS       = 6;
+const CAMERA_ANCHOR_Y    = 470;      // resting screen Y of the ship in free flight
+const CAMERA_LEAD_MAX_UP = 160;      // cap on upward look-ahead (px)
+const ORBIT_FRAME_MARGIN = 90;       // gap left below the orbit's lowest point when latched
+const PLANET_GAP_MIN     = 165;      // min vertical spacing between generated planets
+const PLANET_GAP_MAX     = 285;      // max vertical spacing between generated planets
+const ZOOM_MIN           = 0.72;     // most zoomed-out scale on a fast slingshot
+const ZOOM_SPEED_LO      = 240;      // ship speed where zoom-out begins
+const ZOOM_SPEED_HI      = 640;      // ship speed at full zoom-out
+const ZOOM_LERP          = 3.0;      // how fast the zoom eases between scales
+
+/* =====================================================================
+   CANVAS SETUP & SCALING
+   ===================================================================== */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+let dpr = 1;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  const scale = Math.min(window.innerWidth / LOGICAL_W, window.innerHeight / LOGICAL_H);
+  canvas.width  = Math.round(LOGICAL_W * dpr);
+  canvas.height = Math.round(LOGICAL_H * dpr);
+  canvas.style.width  = (LOGICAL_W * scale) + "px";
+  canvas.style.height = (LOGICAL_H * scale) + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in logical 400x800 space
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* Convert a client (mouse/touch) point into logical game coordinates. */
+function toLogical(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (clientX - rect.left) / rect.width  * LOGICAL_W,
+    y: (clientY - rect.top)  / rect.height * LOGICAL_H
+  };
+}
+
+/* =====================================================================
+   AUDIO — Web Audio death glitch (generated, no files)
+   ===================================================================== */
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch (e) { audioCtx = null; }
+  }
+}
+function playGlitch() {
+  if (!audioCtx) return;
+  const dur = 0.18;
+  const sr = audioCtx.sampleRate;
+  const buffer = audioCtx.createBuffer(1, Math.floor(sr * dur), sr);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < data.length; i++) {
+    // crushed noise — quantize for a digital glitch texture
+    let n = Math.random() * 2 - 1;
+    n = Math.round(n * 4) / 4;
+    data[i] = n;
+  }
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = "bandpass";
+  filter.frequency.value = 900;
+  filter.Q.value = 1.2;
+
+  const gain = audioCtx.createGain();
+  const t = audioCtx.currentTime;
+  gain.gain.setValueAtTime(0.6, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+
+  src.connect(filter);
+  filter.connect(gain);
+  gain.connect(audioCtx.destination);
+  src.start(t);
+  src.stop(t + dur);
+}
+function playPerfect() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  // two quick ascending sine blips
+  [880, 1320].forEach((freq, i) => {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    const start = t + i * 0.07;
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.3, start + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.18);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(start);
+    osc.stop(start + 0.2);
+  });
+}
+
+/* =====================================================================
+   GAME STATE
+   ===================================================================== */
+const PALETTE = ["#ff5d5d", "#ffb14e", "#ffe14e", "#6dff9e",
+                 "#4ec9ff", "#9b6dff", "#ff6dde", "#5ee0c8"];
+
+let state;        // "playing" | "dying" | "dead"
+let cameraY;        // world Y at the top of the screen
+let camVel;         // camera spring velocity state (for smooth-damp follow)
+let camFloor;       // lowest camera target ever seen — the view never pans below it
+let zoom;           // world render scale (1 = normal, < 1 = zoomed out)
+let collapseWorldY; // collapse line in WORLD space (creeps upward at constant rate)
+let drone;        // the player
+let planets;      // array of planet objects
+let trail;        // fading particle trail
+let stars1, stars2;
+let genCursorY;   // world Y where the next planet will be generated
+let maxClimb;     // best vertical distance climbed
+let deathTimer;   // freeze timer during "dying"
+let hintAlpha;    // fading "HOLD to tether" hint
+let pointerDown;  // is a pointer currently held
+let combo;        // consecutive perfect releases (the score chain)
+let bestCombo;    // longest chain this run
+let score;        // accumulated score (climb × chain multiplier)
+let runTime;      // seconds since the run began (drives collapse accel)
+let perfectFx;    // transient perfect-release burst { x, y, t } or null
+
+const DRONE_START_Y = 700;
+
+function makeStars(count) {
+  const arr = [];
+  for (let i = 0; i < count; i++) {
+    arr.push({ x: Math.random() * LOGICAL_W, y: Math.random() * LOGICAL_H });
+  }
+  return arr;
+}
+
+function spawnPlanet(worldY, forceCenter) {
+  const radius = 20 + Math.random() * 30;
+  const margin = radius + 14;
+  const x = forceCenter
+    ? LOGICAL_W / 2 + (Math.random() * 60 - 30)
+    : margin + Math.random() * (LOGICAL_W - margin * 2);
+  return {
+    x: x,
+    y: worldY,
+    radius: radius,
+    color: PALETTE[(Math.random() * PALETTE.length) | 0]
+  };
+}
+
+/* Generate planets upward until we've covered the area above the camera. */
+function generatePlanets() {
+  while (genCursorY > cameraY - 500) {
+    const first = planets.length === 0;
+    planets.push(spawnPlanet(genCursorY, first));
+    genCursorY -= PLANET_GAP_MIN + Math.random() * (PLANET_GAP_MAX - PLANET_GAP_MIN);
+  }
+}
+
+function resetGame() {
+  camVel = { v: 0 };
+  zoom = 1;
+  collapseWorldY = DRONE_START_Y + 130;   // starts just below the drone, off-screen
+  planets = [];
+  trail = [];
+  stars1 = makeStars(60);
+  stars2 = makeStars(40);
+  maxClimb = 0;
+  deathTimer = 0;
+  hintAlpha = 1;
+  pointerDown = false;
+  combo = 0;
+  bestCombo = 0;
+  score = 0;
+  runTime = 0;
+  perfectFx = null;
+
+  drone = {
+    x: LOGICAL_W / 2,
+    y: DRONE_START_Y,
+    vx: 0,
+    vy: -180,                        // launch straight up when the run begins
+    mode: "free",                    // "free" | "tethered"
+    planet: null,
+    angle: 0,
+    orbitRadius: 0,
+    initialOrbitRadius: 0,
+    chargeTime: 0,
+    angleSwept: 0,                   // radians swept since the current tether
+    orbitDir: -1,                    // set per-tether from the ship's motion
+    baseAngSpeed: ORBIT_BASE_ANGULAR_VEL, // orbit speed carried in on tether
+    entrySpeed: 0                    // linear speed at the moment of tethering
+  };
+
+  // frame the camera on the drone, then drop the first planet near the top
+  const lead = Math.max(-CAMERA_LEAD_MAX_UP, Math.min(0, drone.vy * CAMERA_LEAD_TIME));
+  cameraY = drone.y - CAMERA_ANCHOR_Y + lead;
+  camFloor = cameraY;
+  genCursorY = cameraY + 70;          // first planet sits near the top of the screen
+  generatePlanets();
+
+  state = "playing";
+}
+
+/* =====================================================================
+   TETHER / RELEASE MECHANIC
+   ===================================================================== */
+function tryTether() {
+  if (drone.mode !== "free") return;
+  let best = null, bestDist = Infinity;
+  for (const p of planets) {
+    const dx = drone.x - p.x;
+    const dy = drone.y - p.y;
+    const dist = Math.hypot(dx, dy);
+    const zone = p.radius + TETHER_ZONE_OFFSET;
+    if (dist <= zone && dist > p.radius + DRONE_RADIUS && dist < bestDist) {
+      best = p;
+      bestDist = dist;
+    }
+  }
+  if (best) {
+    drone.mode = "tethered";
+    drone.planet = best;
+    drone.angle = Math.atan2(drone.y - best.y, drone.x - best.x);
+    drone.orbitRadius = bestDist;
+    drone.initialOrbitRadius = bestDist;
+    drone.chargeTime = 0;
+    drone.angleSwept = 0;
+    // orbit whichever way the ship is already moving around the planet:
+    // sign of (radial x velocity) gives the natural angular direction
+    const rdx = drone.x - best.x, rdy = drone.y - best.y;
+    const cross = rdx * drone.vy - rdy * drone.vx;
+    drone.orbitDir = cross >= 0 ? 1 : -1;
+    // momentum carry-over: remember the incoming speed (the launch never
+    // drops below it) and seed the orbit speed from the tangential part
+    drone.entrySpeed = Math.hypot(drone.vx, drone.vy);
+    const incomingAng = Math.abs(cross) / (bestDist * bestDist);
+    drone.baseAngSpeed = Math.min(ORBIT_MAX_ANG_VEL,
+                         Math.max(ORBIT_BASE_ANGULAR_VEL, incomingAng));
+    hintAlpha = 0;
+  }
+}
+
+function releaseTether() {
+  if (drone.mode !== "tethered") return;
+  const charge = drone.chargeTime / CHARGE_TIME;
+  const speedCharge = Math.min(charge, 1);
+  const angSpeed = drone.baseAngSpeed * (1 + speedCharge * CHARGE_RATE);
+  const r = drone.orbitRadius;
+  const c = Math.cos(drone.angle);
+  const s = Math.sin(drone.angle);
+
+  // launch tangent to the orbit (unit direction of the orbit's spin)
+  const dirX = -s * drone.orbitDir;
+  const dirY =  c * drone.orbitDir;
+
+  // momentum carry-over: a tether never bleeds speed, it only redirects it —
+  // launch at the faster of the orbital speed or the speed you arrived with
+  let speed = Math.max(r * angSpeed * FLIGHT_SPEED_MULT, drone.entrySpeed);
+
+  // perfect release — let go right as the charge ring completes
+  if (Math.abs(charge - 1) <= PERFECT_WINDOW) {
+    speed *= PERFECT_BONUS;
+    combo++;
+    if (combo > bestCombo) bestCombo = combo;
+    perfectFx = { x: drone.x, y: drone.y, t: 0.6 };
+    playPerfect();
+  } else {
+    combo = 0;                        // a sloppy release breaks the chain
+  }
+
+  speed = Math.min(speed, LAUNCH_SPEED_MAX);
+  drone.vx = dirX * speed;
+  drone.vy = dirY * speed;
+  drone.mode = "free";
+  drone.planet = null;
+}
+
+/* =====================================================================
+   INPUT
+   ===================================================================== */
+canvas.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  ensureAudio();
+  if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+
+  if (state === "start") {
+    resetGame();          // resetGame sets state to "playing"
+    return;
+  }
+  if (state === "dead") {
+    const p = toLogical(e.clientX, e.clientY);
+    if (p.x >= AGAIN_BTN.x && p.x <= AGAIN_BTN.x + AGAIN_BTN.w &&
+        p.y >= AGAIN_BTN.y && p.y <= AGAIN_BTN.y + AGAIN_BTN.h) {
+      resetGame();
+    }
+    return;
+  }
+  pointerDown = true;
+  if (state === "playing") tryTether();
+});
+
+canvas.addEventListener("pointerup", (e) => {
+  e.preventDefault();
+  pointerDown = false;
+  if (state === "playing") releaseTether();
+});
+
+canvas.addEventListener("pointermove", (e) => {
+  e.preventDefault();
+  // Pointer position is not needed for the hold mechanic, but tracking the
+  // event keeps mouse + touch behaviour identical and prevents scroll.
+});
+
+canvas.addEventListener("pointercancel", () => {
+  pointerDown = false;
+  if (state === "playing") releaseTether();
+});
+
+/* =====================================================================
+   UPDATE
+   ===================================================================== */
+function die() {
+  state = "dying";
+  deathTimer = 0.2;
+  playGlitch();
+}
+
+/* Critically-damped spring follow (Unity-style SmoothDamp). Eases toward a
+   moving target with no overshoot and no stutter; `vel` is a mutable {v}
+   object that carries the spring's velocity between frames. */
+function smoothDamp(current, target, vel, smoothTime, dt) {
+  smoothTime = Math.max(0.0001, smoothTime);
+  const omega = 2 / smoothTime;
+  const x = omega * dt;
+  const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+  const change = current - target;
+  const temp = (vel.v + omega * change) * dt;
+  vel.v = (vel.v - omega * temp) * exp;
+  return target + (change + temp) * exp;
+}
+
+function update(dt) {
+  runTime += dt;
+  // the collapse keeps speeding up, so every run escalates to a climax
+  collapseWorldY -= (COLLAPSE_RISE_SPEED + runTime * COLLAPSE_ACCEL) * dt;
+
+  // --- drone ---
+  if (drone.mode === "free") {
+    // keep trying to grab a tether while the pointer is held
+    if (pointerDown) tryTether();
+
+    if (drone.mode === "free") {
+      drone.x += drone.vx * dt;
+      drone.y += drone.vy * dt;
+      // spawn fading trail particle
+      trail.push({ x: drone.x, y: drone.y, life: 0.5, max: 0.5 });
+    }
+  }
+
+  if (drone.mode === "tethered") {
+    const p = drone.planet;
+    drone.chargeTime += dt;
+    const speedCharge = Math.min(drone.chargeTime / CHARGE_TIME, 1);
+    const angSpeed = drone.baseAngSpeed * (1 + speedCharge * CHARGE_RATE);
+
+    // track orbits swept — the orbit spirals inward and collapses into the
+    // planet once it has wound around OVERCHARGE_ORBITS full times
+    drone.angleSwept += angSpeed * dt;
+    const revs = drone.angleSwept / (Math.PI * 2);
+    if (revs >= OVERCHARGE_ORBITS) { die(); return; }
+
+    const surfaceR = p.radius + DRONE_RADIUS;
+    const rFrac = revs / OVERCHARGE_ORBITS;       // 0 = initial radius, 1 = surface
+    const targetR = drone.initialOrbitRadius +
+                    (surfaceR - drone.initialOrbitRadius) * rFrac;
+    drone.orbitRadius += (targetR - drone.orbitRadius) * Math.min(1, dt * 8);
+
+    drone.angle += angSpeed * drone.orbitDir * dt;
+    drone.x = p.x + Math.cos(drone.angle) * drone.orbitRadius;
+    drone.y = p.y + Math.sin(drone.angle) * drone.orbitRadius;
+  }
+
+  // --- trail aging ---
+  for (let i = trail.length - 1; i >= 0; i--) {
+    trail[i].life -= dt;
+    if (trail[i].life <= 0) trail.splice(i, 1);
+  }
+
+  if (perfectFx) {
+    perfectFx.t -= dt;
+    if (perfectFx.t <= 0) perfectFx = null;
+  }
+
+  // --- score: climb distance, multiplied by the perfect-chain combo ---
+  const climb = DRONE_START_Y - drone.y;
+  if (climb > maxClimb) {
+    score += (climb - maxClimb) * (1 + combo * COMBO_STEP);
+    maxClimb = climb;
+  }
+
+  // --- world streaming ---
+  generatePlanets();
+  for (let i = planets.length - 1; i >= 0; i--) {
+    if (planets[i] !== drone.planet && planets[i].y - cameraY > LOGICAL_H + 150) {
+      planets.splice(i, 1);
+    }
+  }
+
+  if (hintAlpha > 0) hintAlpha = Math.max(0, hintAlpha - dt * 0.4);
+
+  // --- camera ---------------------------------------------------------
+  // Climb-only follow. We compute a raw target, then drive the spring at
+  // the LOWEST target ever seen (camFloor). Since camFloor only decreases,
+  // the critically-damped spring only ever moves the view upward — it can
+  // never pan back down — and the spring keeps that motion perfectly
+  // smooth. When the ship descends, the camera simply holds and the ship
+  // drops within the frame; no freeze, no catch-up lurch.
+  let rawTarget;
+  if (drone.mode === "tethered") {
+    const p = drone.planet;
+    rawTarget = (p.y + drone.orbitRadius + ORBIT_FRAME_MARGIN) - LOGICAL_H;
+  } else {
+    // look-ahead, clamped up-only (a downward lead would pull the view down)
+    const lead = Math.max(-CAMERA_LEAD_MAX_UP,
+                          Math.min(0, drone.vy * CAMERA_LEAD_TIME));
+    rawTarget = drone.y - CAMERA_ANCHOR_Y + lead;
+  }
+  camFloor = Math.min(camFloor, rawTarget);
+  cameraY = smoothDamp(cameraY, camFloor, camVel, CAMERA_SMOOTH_TIME, dt);
+
+  // --- zoom: pull the view back when the ship is screaming along -------
+  const speed = (drone.mode === "free")
+    ? Math.hypot(drone.vx, drone.vy) : 0;
+  const zt = Math.max(0, Math.min(1,
+    (speed - ZOOM_SPEED_LO) / (ZOOM_SPEED_HI - ZOOM_SPEED_LO)));
+  const zoomTarget = 1 - zt * (1 - ZOOM_MIN);
+  zoom += (zoomTarget - zoom) * Math.min(1, dt * ZOOM_LERP);
+
+  // --- death checks --- (planets are pass-through — pure opportunities)
+  // 1) fell below the collapse wash
+  if (drone.y > collapseWorldY) { die(); return; }
+  // 2) drifted a full third of a screen past the left / right edge
+  if (drone.x < -LOGICAL_W / 3 || drone.x > LOGICAL_W + LOGICAL_W / 3) { die(); return; }
+}
+
+/* =====================================================================
+   RENDER
+   ===================================================================== */
+function mod(v, m) { return ((v % m) + m) % m; }
+
+function drawStars(layer, factor, size, alpha) {
+  ctx.fillStyle = "rgba(255,255,255," + alpha + ")";
+  const off = mod(-cameraY * factor, LOGICAL_H);
+  for (const s of layer) {
+    const y = mod(s.y + off, LOGICAL_H);
+    ctx.fillRect(s.x, y, size, size);
+  }
+}
+
+function drawWorld() {
+  // background
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+  // parallax starfield (drawn unscaled — pure background)
+  drawStars(stars1, 0.30, 1.5, 0.45);
+  drawStars(stars2, 0.60, 2.0, 0.85);
+
+  // --- zoomed world layer: scale everything around the ship so a fast
+  //     slingshot pulls the view back without the ship leaving frame ----
+  const focalX = drone.x;
+  const focalY = drone.y - cameraY;
+  ctx.save();
+  ctx.translate(focalX, focalY);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-focalX, -focalY);
+
+  // planets
+  for (const p of planets) {
+    const sx = p.x;
+    const sy = p.y - cameraY;
+    if (sy < -700 || sy > LOGICAL_H + 700) continue;
+
+    // tether zone ring
+    ctx.beginPath();
+    ctx.arc(sx, sy, p.radius + TETHER_ZONE_OFFSET, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // body
+    ctx.beginPath();
+    ctx.arc(sx, sy, p.radius, 0, Math.PI * 2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+
+    // charge ring while this planet is tethered
+    if (drone.mode === "tethered" && drone.planet === p) {
+      const ch = drone.chargeTime / CHARGE_TIME;
+      const filled = Math.min(ch, 1);
+      let col;
+      if (ch < 1 - PERFECT_WINDOW)       col = "#9be8ff";  // still charging
+      else if (ch <= 1 + PERFECT_WINDOW) col = "#7dff8f";  // perfect — release now!
+      else                               col = "#ff5d5d";  // overcharged — danger
+      ctx.beginPath();
+      ctx.arc(sx, sy, p.radius + 9, -Math.PI / 2,
+              -Math.PI / 2 + filled * Math.PI * 2);
+      ctx.strokeStyle = col;
+      ctx.lineWidth = ch >= 1 - PERFECT_WINDOW ? 5 : 4;
+      ctx.lineCap = "round";
+      ctx.stroke();
+      ctx.lineCap = "butt";
+    }
+  }
+
+  // tether line
+  if (drone.mode === "tethered" && drone.planet) {
+    const p = drone.planet;
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y - cameraY);
+    ctx.lineTo(drone.x, drone.y - cameraY);
+    ctx.strokeStyle = "rgba(155,232,255,0.5)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  // trail
+  for (const t of trail) {
+    const a = t.life / t.max;
+    ctx.fillStyle = "rgba(255,255,255," + (a * 0.6) + ")";
+    const r = DRONE_RADIUS * a * 0.9;
+    ctx.beginPath();
+    ctx.arc(t.x, t.y - cameraY, Math.max(0.5, r), 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // drone (radius divided by zoom so the player dot stays a constant size)
+  ctx.beginPath();
+  ctx.arc(drone.x, drone.y - cameraY, DRONE_RADIUS / zoom, 0, Math.PI * 2);
+  ctx.fillStyle = "#ffffff";
+  ctx.fill();
+
+  // perfect-release burst
+  if (perfectFx) {
+    const k = perfectFx.t / 0.6;
+    const fr = 14 + (1 - k) * 48;
+    ctx.beginPath();
+    ctx.arc(perfectFx.x, perfectFx.y - cameraY, fr, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(125,255,143," + (k * 0.9) + ")";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+
+  // collapse wash (world-anchored — climbing away from it is the goal)
+  const collapseScreenY = collapseWorldY - cameraY;
+  if (collapseScreenY < LOGICAL_H + 900) {
+    const grad = ctx.createLinearGradient(0, collapseScreenY,
+                                          0, collapseScreenY + 220);
+    grad.addColorStop(0, "rgba(255,40,40,0)");
+    grad.addColorStop(0.35, "rgba(220,20,20,0.5)");
+    grad.addColorStop(1, "rgba(255,30,30,0.85)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(-1000, collapseScreenY, LOGICAL_W + 2000, LOGICAL_H + 2000);
+    ctx.fillStyle = "rgba(255,120,120,0.9)";
+    ctx.fillRect(-1000, collapseScreenY, LOGICAL_W + 2000, 2 / zoom);
+  }
+
+  ctx.restore();   // end zoomed world layer
+
+  // HUD score
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "16px monospace";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText("SCORE " + Math.floor(score / 10), 12, 12);
+  if (combo > 0) {
+    const mult = (1 + combo * COMBO_STEP).toFixed(1);
+    ctx.fillStyle = "#7dff8f";
+    ctx.font = "bold 20px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("CHAIN ×" + mult, LOGICAL_W / 2, 14);
+    ctx.textAlign = "left";
+  }
+
+  // intro hint
+  if (hintAlpha > 0) {
+    ctx.fillStyle = "rgba(255,255,255," + hintAlpha + ")";
+    ctx.font = "14px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("HOLD inside a ring to tether — release to launch",
+                 LOGICAL_W / 2, LOGICAL_H - 60);
+    ctx.textAlign = "left";
+  }
+
+  // perfect-release banner
+  if (perfectFx) {
+    const k = perfectFx.t / 0.6;
+    ctx.fillStyle = "rgba(125,255,143," + k + ")";
+    ctx.font = "bold 26px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("PERFECT!", LOGICAL_W / 2, 150 - (1 - k) * 26);
+    ctx.textAlign = "left";
+  }
+}
+
+function drawStartScreen() {
+  ctx.fillStyle = "rgba(0,0,0,0.65)";
+  ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  ctx.fillStyle = "#9be8ff";
+  ctx.font = "bold 48px monospace";
+  ctx.fillText("SLINGLINE", LOGICAL_W / 2, 300);
+
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "15px monospace";
+  ctx.fillText("HOLD inside a ring to tether — release to launch",
+               LOGICAL_W / 2, 358);
+
+  // pulsing prompt
+  const pulse = 0.55 + 0.45 * Math.sin(performance.now() / 300);
+  ctx.fillStyle = "rgba(255,255,255," + pulse + ")";
+  ctx.font = "bold 24px monospace";
+  ctx.fillText("TAP TO START", LOGICAL_W / 2, 470);
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+}
+
+const AGAIN_BTN = { x: 120, y: 470, w: 160, h: 56 };
+
+function drawOverlay() {
+  // dim
+  ctx.fillStyle = "rgba(0,0,0,0.7)";
+  ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  ctx.fillStyle = "#ff5d5d";
+  ctx.font = "bold 40px monospace";
+  ctx.fillText("COLLAPSED", LOGICAL_W / 2, 300);
+
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "20px monospace";
+  ctx.fillText("SCORE", LOGICAL_W / 2, 370);
+  ctx.font = "bold 52px monospace";
+  ctx.fillText(String(Math.floor(score / 10)), LOGICAL_W / 2, 415);
+
+  if (bestCombo > 0) {
+    ctx.fillStyle = "#7dff8f";
+    ctx.font = "15px monospace";
+    ctx.fillText("BEST CHAIN  ×" + bestCombo, LOGICAL_W / 2, 446);
+  }
+
+  // Again button
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(AGAIN_BTN.x, AGAIN_BTN.y, AGAIN_BTN.w, AGAIN_BTN.h);
+  ctx.fillStyle = "#000000";
+  ctx.font = "bold 24px monospace";
+  ctx.fillText("AGAIN", LOGICAL_W / 2, AGAIN_BTN.y + AGAIN_BTN.h / 2 + 1);
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+}
+
+/* =====================================================================
+   MAIN LOOP
+   ===================================================================== */
+let lastTime = performance.now();
+
+function frame(now) {
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  if (dt > 0.05) dt = 0.05;          // clamp big stalls
+
+  if (state === "start") {
+    drawWorld();
+    drawStartScreen();
+  } else if (state === "playing") {
+    update(dt);
+    drawWorld();
+  } else if (state === "dying") {
+    // frozen frame + red flash
+    drawWorld();
+    deathTimer -= dt;
+    const flash = Math.min(0.7, deathTimer / 0.2 * 0.7);
+    ctx.fillStyle = "rgba(255,0,0," + Math.max(0, flash) + ")";
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    if (deathTimer <= 0) state = "dead";
+  } else if (state === "dead") {
+    drawWorld();
+    drawOverlay();
+  }
+
+  requestAnimationFrame(frame);
+}
+
+resetGame();
+state = "start";          // wait for a tap before the first run
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
